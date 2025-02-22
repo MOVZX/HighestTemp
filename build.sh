@@ -1,3 +1,3 @@
 #!/usr/bin/env bash
 
-gcc -o highesttemp highesttemp.c
+gcc -O2 -o highesttemp highesttemp.c -lm
