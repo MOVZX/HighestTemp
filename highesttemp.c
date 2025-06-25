@@ -1,130 +1,296 @@
+/*
+ * highesttemp - A daemon to find and export the highest system temperature.
+ *
+ * Copyright (C) 2025 MOVZX
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor,
+ * Boston, MA 02110-1301, USA.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <string.h>
-#include <errno.h>
+#include <glob.h>
+#include <limits.h>
+#include <signal.h>
 
-#define DT          1000000          // 1 second sleep
-#define BUFFER_SIZE 16              // Enough for temperature values
-#define MAX_TEMP    -2147483648     // -2147483648 = 0x80000000
-#define NUM_SENSORS 5               // Number of hardware sensors
+#ifdef NVIDIA
+#include <nvml.h>
+#endif
 
-static const char* sensors[] =
+#define DT 1000000
+#define BUFFER_SIZE 32
+#define SENSOR_INITIAL_CAPACITY 8
+
+static int *discovered_sensor_fds = NULL;
+static int num_discovered_sensors = 0;
+static int sensor_capacity = 0;
+
+#ifdef NVIDIA
+static nvmlDevice_t nvidia_device;
+#endif
+
+static const char *outfile = "/dev/shm/highesttemp";
+static volatile sig_atomic_t running = 1;
+
+/**
+ * Signal handler for SIGTERM and SIGINT. Sets the running flag to zero,
+ * causing the main loop to exit.
+ *
+ * @param signum the signal number that was received
+ */
+static void handle_sigterm(int signum)
 {
-    // HW Sensors on my PC
-    "/sys/class/hwmon/hwmon2/temp1_input", // NVMe 1
-    "/sys/class/hwmon/hwmon3/temp1_input", // NVMe 2
-    "/sys/class/hwmon/hwmon4/temp1_input", // NVMe 3
-    "/sys/class/hwmon/hwmon5/temp1_input", // NVMe 4
-    "/sys/class/hwmon/hwmon6/temp1_input"  // CPU
-};
+    (void)signum;
 
-// Save the highest value of sensor readings to TMPFS
-static const char* outfile = "/tmp/highesttemp";
+    running = 0;
+}
 
-int read_temperature(const char* sensor_path)
+/**
+ * Discovers all available temperature sensors and stores their file
+ * descriptors in a dynamically allocated array.
+ *
+ * This function is called once at the start of the program and is
+ * responsible for setting up the array of discovered sensors.
+ *
+ * All file descriptors in the array are opened with O_RDONLY and
+ * O_CLOEXEC, so they are all safe to read from and will be automatically
+ * closed if the program execs.
+ *
+ * @note This function does not return a value; instead, it modifies the
+ * global variables discovered_sensor_fds, num_discovered_sensors, and
+ * sensor_capacity.
+ */
+static void discover_sensors(void)
 {
-    int fd = open(sensor_path, O_RDONLY);
+    glob_t hwmon_paths;
 
-    if (fd == -1)
+    if (glob("/sys/class/hwmon/hwmon*", 0, NULL, &hwmon_paths) != 0)
+        return;
+
+    for (size_t i = 0; i < hwmon_paths.gl_pathc; i++)
     {
-        fprintf(stderr, "Error opening sensor file %s: %s\n", sensor_path, strerror(errno));
+        char name_path[PATH_MAX];
 
-        return -1;
-    }
+        snprintf(name_path, sizeof(name_path), "%s/name", hwmon_paths.gl_pathv[i]);
 
-    char buffer[BUFFER_SIZE];
-    ssize_t bytes_read = read(fd, buffer, sizeof(buffer) - 1);
+        int fd = open(name_path, O_RDONLY | O_CLOEXEC);
 
-    close(fd);
+        if (fd == -1)
+            continue;
 
-    if (bytes_read <= 0)
-    {
-        fprintf(stderr, "Error reading sensor file %s: %s\n", sensor_path, strerror(errno));
+        char buffer[BUFFER_SIZE];
+        ssize_t bytes_read = read(fd, buffer, sizeof(buffer) - 1);
 
         close(fd);
 
-        return -1;
+        if (bytes_read <= 0)
+            continue;
+
+        buffer[bytes_read] = '\0';
+        char *nl = strchr(buffer, '\n');
+
+        if (nl)
+            *nl = '\0';
+
+        if (strcmp(buffer, "k10temp") == 0 || strcmp(buffer, "amdgpu") == 0 || strcmp(buffer, "coretemp") == 0)
+        {
+            char temp_pattern[PATH_MAX];
+
+            snprintf(temp_pattern, sizeof(temp_pattern), "%s/temp*_input", hwmon_paths.gl_pathv[i]);
+
+            glob_t temp_paths;
+
+            if (glob(temp_pattern, 0, NULL, &temp_paths) == 0)
+            {
+                for (size_t j = 0; j < temp_paths.gl_pathc; j++)
+                {
+                    int temp_fd = open(temp_paths.gl_pathv[j], O_RDONLY | O_CLOEXEC);
+
+                    if (temp_fd == -1)
+                        continue;
+
+                    if (num_discovered_sensors >= sensor_capacity)
+                    {
+                        int new_capacity = (sensor_capacity == 0) ? SENSOR_INITIAL_CAPACITY : sensor_capacity * 2;
+                        int *new_sensors = realloc(discovered_sensor_fds, new_capacity * sizeof(int));
+
+                        if (new_sensors == NULL)
+                        {
+                            close(temp_fd);
+                            globfree(&temp_paths);
+
+                            goto cleanup_hwmon;
+                        }
+
+                        discovered_sensor_fds = new_sensors;
+                        sensor_capacity = new_capacity;
+                    }
+
+                    discovered_sensor_fds[num_discovered_sensors++] = temp_fd;
+                }
+
+                globfree(&temp_paths);
+            }
+        }
     }
 
-    buffer[bytes_read] = '\0';
-
-    return atoi(buffer);
+cleanup_hwmon:
+    globfree(&hwmon_paths);
 }
 
-int read_nvidia_gpu_temperature()
+/**
+ * Reads a temperature from a given sensor file descriptor.
+ *
+ * This function reads up to @c BUFFER_SIZE - 1 bytes from the given
+ * sensor file descriptor, attempts to parse the result as a decimal
+ * integer, and returns that value. If any step of the process fails,
+ * @c INT_MIN is returned.
+ *
+ * @param sensor_fd the file descriptor of the sensor to read from
+ * @return the temperature read from the sensor, or @c INT_MIN on error
+ */
+static int read_temperature(int sensor_fd)
 {
-    FILE* fp = popen("nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits", "r");
-
-    if (!fp)
-    {
-        fprintf(stderr, "Error executing nvidia-smi: %s\n", strerror(errno));
-
-        return -1;
-    }
-
     char buffer[BUFFER_SIZE];
 
-    if (!fgets(buffer, sizeof(buffer), fp))
-    {
-        fprintf(stderr, "Error reading Nvidia GPU temperature: %s\n", strerror(errno));
+    if (lseek(sensor_fd, 0, SEEK_SET) == -1)
+        return INT_MIN;
 
-        pclose(fp);
+    ssize_t bytes_read = read(sensor_fd, buffer, sizeof(buffer) - 1);
 
-        return -1;
-    }
+    if (bytes_read <= 0)
+        return INT_MIN;
 
-    pclose(fp);
+    buffer[bytes_read] = '\0';
+    char *endptr;
+    long temp = strtol(buffer, &endptr, 10);
 
-    return atoi(buffer) * 1000;
+    if (endptr == buffer || (*endptr != '\0' && *endptr != '\n'))
+        return INT_MIN;
+
+    if (temp > INT_MAX || temp < INT_MIN)
+        return INT_MIN;
+
+    return (int)temp;
 }
 
-int main()
+#ifdef NVIDIA
+static void init_nvidia(void)
 {
-    FILE* myfile = fopen(outfile, "w");
+    if (nvmlInit_v2() != NVML_SUCCESS)
+        return;
+
+    if (nvmlDeviceGetHandleByIndex_v2(0, &nvidia_device) != NVML_SUCCESS)
+    {
+        nvmlShutdown();
+
+        return;
+    }
+}
+
+static int read_nvidia_gpu_temperature(void)
+{
+    unsigned int temp;
+    nvmlReturn_t result = nvmlDeviceGetTemperature(nvidia_device, NVML_TEMPERATURE_GPU, &temp);
+
+    if (result != NVML_SUCCESS)
+        return INT_MIN;
+
+    return (int)temp * 1000;
+}
+#endif
+
+static void cleanup_globals(void)
+{
+    for (int i = 0; i < num_discovered_sensors; i++)
+    {
+        close(discovered_sensor_fds[i]);
+    }
+
+    free(discovered_sensor_fds);
+
+    discovered_sensor_fds = NULL;
+    num_discovered_sensors = 0;
+    sensor_capacity = 0;
+
+#ifdef NVIDIA
+    nvmlShutdown();
+#endif
+}
+
+int main(void)
+{
+    struct sigaction action;
+
+    memset(&action, 0, sizeof(struct sigaction));
+
+    action.sa_handler = handle_sigterm;
+
+    sigaction(SIGTERM, &action, NULL);
+    sigaction(SIGINT, &action, NULL);
+    discover_sensors();
+
+#ifdef NVIDIA
+    init_nvidia();
+#endif
+
+    FILE *myfile = fopen(outfile, "w");
 
     if (!myfile)
     {
-        fprintf(stderr, "Error opening output file %s: %s\n", outfile, strerror(errno));
+        cleanup_globals();
 
         return 1;
     }
 
     setlinebuf(myfile);
 
-    while (1)
+    while (running)
     {
         usleep(DT);
 
-        int highest_current_temp = MAX_TEMP;
+        int highest_current_temp = INT_MIN;
 
-        for (int i = 0; i < NUM_SENSORS; i++)
+        for (int i = 0; i < num_discovered_sensors; i++)
         {
-            int temp = read_temperature(sensors[i]);
+            int temp = read_temperature(discovered_sensor_fds[i]);
 
-            if (temp != -1 && temp > highest_current_temp)
-            highest_current_temp = temp;
+            if (temp > highest_current_temp)
+                highest_current_temp = temp;
         }
 
+#ifdef NVIDIA
         int nvidia_temp = read_nvidia_gpu_temperature();
 
-        if (nvidia_temp != -1 && nvidia_temp > highest_current_temp)
-        highest_current_temp = nvidia_temp;
+        if (nvidia_temp > highest_current_temp)
+            highest_current_temp = nvidia_temp;
+#endif
 
-        if (highest_current_temp != MAX_TEMP)
+        if (highest_current_temp != INT_MIN)
         {
-            rewind(myfile);
-            fprintf(myfile, "%d\n", highest_current_temp);
-            ftruncate(fileno(myfile), ftell(myfile));
+            if (fseek(myfile, 0, SEEK_SET) == 0)
+                fprintf(myfile, "%d\n", highest_current_temp);
         }
-
-        // Debug
-        // printf("Highest Temp: %d\n", highest_current_temp);
-
     }
 
     fclose(myfile);
+    remove(outfile);
+    cleanup_globals();
 
     return 0;
 }

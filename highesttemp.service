@@ -1,0 +1,12 @@
+[Unit]
+Description=Get Highest Temperature
+Before=fancontrol.service
+
+[Service]
+ExecStart=/usr/local/bin/highesttemp
+Restart=Always
+User=root
+Group=root
+
+[Install]
+WantedBy=default.target
