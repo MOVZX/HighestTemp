@@ -27,6 +27,11 @@
 #include <glob.h>
 #include <limits.h>
 #include <signal.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <syslog.h>
+#include <pwd.h>
+#include <grp.h>
 
 #ifdef NVIDIA
 #include <nvml.h>
@@ -39,6 +44,7 @@
 static int *discovered_sensor_fds = NULL;
 static int num_discovered_sensors = 0;
 static int sensor_capacity = 0;
+static int output_fd = -1;
 
 #ifdef NVIDIA
 static nvmlDevice_t nvidia_device;
@@ -107,7 +113,7 @@ static void discover_sensors(void)
         if (nl)
             *nl = '\0';
 
-        if (strcmp(buffer, "k10temp") == 0 || strcmp(buffer, "amdgpu") == 0 || strcmp(buffer, "coretemp") == 0)
+        if (strcmp(buffer, "k10temp") == 0 || strcmp(buffer, "amdgpu") == 0 || strcmp(buffer, "coretemp") == 0 || strcmp(buffer, "nvme") == 0)
         {
             char temp_pattern[PATH_MAX];
 
@@ -190,6 +196,13 @@ static int read_temperature(int sensor_fd)
 }
 
 #ifdef NVIDIA
+/**
+ * Initializes the NVIDIA Management Library (NVML) and selects the first
+ * available NVIDIA device for temperature reading.
+ *
+ * This function is a no-op if the NVML library is unavailable or if the
+ * initialization fails.
+ */
 static void init_nvidia(void)
 {
     if (nvmlInit_v2() != NVML_SUCCESS)
@@ -203,6 +216,16 @@ static void init_nvidia(void)
     }
 }
 
+/**
+ * Reads the temperature of the NVIDIA GPU.
+ *
+ * Utilizes the NVIDIA Management Library (NVML) to retrieve the current
+ * temperature of the GPU. The temperature is returned in millidegrees
+ * Celsius. If the temperature retrieval fails, the function returns
+ * INT_MIN to indicate an error.
+ *
+ * @return the GPU temperature in millidegrees Celsius, or INT_MIN on error
+ */
 static int read_nvidia_gpu_temperature(void)
 {
     unsigned int temp;
@@ -215,6 +238,13 @@ static int read_nvidia_gpu_temperature(void)
 }
 #endif
 
+/**
+ * Frees all dynamically allocated memory, closes all open file descriptors,
+ * and resets all global state to its initial values.
+ *
+ * This function is called when the program is exiting due to a signal or
+ * error.
+ */
 static void cleanup_globals(void)
 {
     for (int i = 0; i < num_discovered_sensors; i++)
@@ -228,14 +258,86 @@ static void cleanup_globals(void)
     num_discovered_sensors = 0;
     sensor_capacity = 0;
 
+    if (output_fd != -1)
+    {
+        close(output_fd);
+        output_fd = -1;
+    }
+
 #ifdef NVIDIA
     nvmlShutdown();
 #endif
 }
 
+/**
+ * Main function of the highesttemp daemon.
+ *
+ * This function initializes logging, sets up signal handling for graceful
+ * termination, discovers available temperature sensors, and optionally
+ * initializes NVIDIA GPU temperature reading support. It then enters the
+ * main loop, which runs until terminated, reading temperatures from
+ * discovered sensors and writing the highest temperature to the output
+ * file at regular intervals. The output file is created with specified
+ * permissions and ownership, and the process drops root privileges after
+ * setup is complete.
+ *
+ * @return 0 on successful completion, 1 on error during initialization.
+ */
 int main(void)
 {
     struct sigaction action;
+    struct passwd *pw;
+    struct group *gr;
+    uid_t target_uid;
+    gid_t target_gid;
+
+    openlog("highesttemp", LOG_PID | LOG_CONS, LOG_DAEMON);
+
+    int out_fd = open(outfile, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+
+    if (out_fd == -1)
+    {
+        syslog(LOG_ERR, "Failed to open output file %s: %m", outfile);
+
+        cleanup_globals();
+        closelog();
+
+        return 1;
+    }
+
+    pw = getpwnam("goghor");
+
+    if (pw == NULL)
+    {
+        syslog(LOG_ERR, "User 'goghor' not found: %m");
+
+        close(out_fd);
+        cleanup_globals();
+        closelog();
+
+        return 1;
+    }
+
+    gr = getgrnam("goghor");
+
+    if (gr == NULL)
+    {
+        syslog(LOG_ERR, "Group 'goghor' not found: %m");
+
+        close(out_fd);
+        cleanup_globals();
+        closelog();
+
+        return 1;
+    }
+
+    target_uid = pw->pw_uid;
+    target_gid = gr->gr_gid;
+
+    if (fchown(out_fd, target_uid, target_gid) == -1)
+        syslog(LOG_WARNING, "Failed to chown output file %s: %m", outfile);
+
+    output_fd = out_fd;
 
     memset(&action, 0, sizeof(struct sigaction));
 
@@ -249,16 +351,28 @@ int main(void)
     init_nvidia();
 #endif
 
-    FILE *myfile = fopen(outfile, "w");
-
-    if (!myfile)
+    if (setgid(target_gid) == -1)
     {
+        syslog(LOG_ERR, "Failed to setgid to 'goghor': %m");
+
         cleanup_globals();
+        closelog();
 
         return 1;
     }
 
-    setlinebuf(myfile);
+    if (setuid(target_uid) == -1)
+    {
+        syslog(LOG_ERR, "Failed to setuid to 'goghor': %m");
+
+        cleanup_globals();
+        closelog();
+
+        return 1;
+    }
+
+    if (setgroups(1, &target_gid) == -1)
+        syslog(LOG_WARNING, "Failed to setgroups: %m");
 
     while (running)
     {
@@ -283,14 +397,22 @@ int main(void)
 
         if (highest_current_temp != INT_MIN)
         {
-            if (fseek(myfile, 0, SEEK_SET) == 0)
-                fprintf(myfile, "%d\n", highest_current_temp);
+            if (lseek(output_fd, 0, SEEK_SET) == -1)
+            {
+                syslog(LOG_WARNING, "lseek failed for output file: %m");
+            }
+            else
+            {
+                dprintf(output_fd, "%d\n", highest_current_temp);
+
+                if (fsync(output_fd) == -1)
+                    syslog(LOG_WARNING, "fsync failed for output file: %m");
+            }
         }
     }
 
-    fclose(myfile);
-    remove(outfile);
     cleanup_globals();
+    closelog();
 
     return 0;
 }

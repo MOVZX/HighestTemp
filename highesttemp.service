@@ -1,12 +1,12 @@
 [Unit]
-Description=Get Highest Temperature
+Description=HighestTemp Daemon - Provides the highest system temperature for fan control
 Before=fancontrol.service
 
 [Service]
 ExecStart=/usr/local/bin/highesttemp
 Restart=Always
-User=root
-Group=root
+User=goghor
+Group=goghor
 
 [Install]
 WantedBy=default.target
