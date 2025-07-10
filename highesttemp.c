@@ -54,10 +54,12 @@ static const char *outfile = "/dev/shm/highesttemp";
 static volatile sig_atomic_t running = 1;
 
 /**
- * Signal handler for SIGTERM and SIGINT. Sets the running flag to zero,
- * causing the main loop to exit.
+ * Signal handler for SIGTERM.
  *
- * @param signum the signal number that was received
+ * Sets the running flag to 0, triggering the loop in main() to exit
+ * gracefully.
+ *
+ * @param signum The signal number, ignored.
  */
 static void handle_sigterm(int signum)
 {
@@ -67,26 +69,23 @@ static void handle_sigterm(int signum)
 }
 
 /**
- * Discovers all available temperature sensors and stores their file
- * descriptors in a dynamically allocated array.
+ * Discovers and opens temperature sensor files from hwmon devices.
  *
- * This function is called once at the start of the program and is
- * responsible for setting up the array of discovered sensors.
+ * This function scans the /sys/class/hwmon directory for hardware
+ * monitor devices. It identifies devices of interest such as "k10temp",
+ * "amdgpu", "coretemp", and "nvme". For each device found, it opens
+ * available temperature input files and stores their file descriptors
+ * in the discovered_sensor_fds array, expanding the array as needed.
  *
- * All file descriptors in the array are opened with O_RDONLY and
- * O_CLOEXEC, so they are all safe to read from and will be automatically
- * closed if the program execs.
- *
- * @note This function does not return a value; instead, it modifies the
- * global variables discovered_sensor_fds, num_discovered_sensors, and
- * sensor_capacity.
+ * @return 0 on success, -1 on memory allocation failure.
  */
-static void discover_sensors(void)
+
+static int discover_sensors(void)
 {
     glob_t hwmon_paths;
 
     if (glob("/sys/class/hwmon/hwmon*", 0, NULL, &hwmon_paths) != 0)
-        return;
+        return 0;
 
     for (size_t i = 0; i < hwmon_paths.gl_pathc; i++)
     {
@@ -137,10 +136,13 @@ static void discover_sensors(void)
 
                         if (new_sensors == NULL)
                         {
+                            syslog(LOG_ERR, "Failed to reallocate memory for sensors: %m");
+
                             close(temp_fd);
                             globfree(&temp_paths);
+                            globfree(&hwmon_paths);
 
-                            goto cleanup_hwmon;
+                            return -1;
                         }
 
                         discovered_sensor_fds = new_sensors;
@@ -155,21 +157,11 @@ static void discover_sensors(void)
         }
     }
 
-cleanup_hwmon:
     globfree(&hwmon_paths);
+
+    return 0;
 }
 
-/**
- * Reads a temperature from a given sensor file descriptor.
- *
- * This function reads up to @c BUFFER_SIZE - 1 bytes from the given
- * sensor file descriptor, attempts to parse the result as a decimal
- * integer, and returns that value. If any step of the process fails,
- * @c INT_MIN is returned.
- *
- * @param sensor_fd the file descriptor of the sensor to read from
- * @return the temperature read from the sensor, or @c INT_MIN on error
- */
 static int read_temperature(int sensor_fd)
 {
     char buffer[BUFFER_SIZE];
@@ -184,9 +176,10 @@ static int read_temperature(int sensor_fd)
 
     buffer[bytes_read] = '\0';
     char *endptr;
+    errno = 0;
     long temp = strtol(buffer, &endptr, 10);
 
-    if (endptr == buffer || (*endptr != '\0' && *endptr != '\n'))
+    if (endptr == buffer || (*endptr != '\0' && *endptr != '\n') || errno == ERANGE)
         return INT_MIN;
 
     if (temp > INT_MAX || temp < INT_MIN)
@@ -196,13 +189,6 @@ static int read_temperature(int sensor_fd)
 }
 
 #ifdef NVIDIA
-/**
- * Initializes the NVIDIA Management Library (NVML) and selects the first
- * available NVIDIA device for temperature reading.
- *
- * This function is a no-op if the NVML library is unavailable or if the
- * initialization fails.
- */
 static void init_nvidia(void)
 {
     if (nvmlInit_v2() != NVML_SUCCESS)
@@ -216,16 +202,6 @@ static void init_nvidia(void)
     }
 }
 
-/**
- * Reads the temperature of the NVIDIA GPU.
- *
- * Utilizes the NVIDIA Management Library (NVML) to retrieve the current
- * temperature of the GPU. The temperature is returned in millidegrees
- * Celsius. If the temperature retrieval fails, the function returns
- * INT_MIN to indicate an error.
- *
- * @return the GPU temperature in millidegrees Celsius, or INT_MIN on error
- */
 static int read_nvidia_gpu_temperature(void)
 {
     unsigned int temp;
@@ -234,17 +210,13 @@ static int read_nvidia_gpu_temperature(void)
     if (result != NVML_SUCCESS)
         return INT_MIN;
 
+    if (temp > (INT_MAX / 1000))
+        return INT_MIN;
+
     return (int)temp * 1000;
 }
 #endif
 
-/**
- * Frees all dynamically allocated memory, closes all open file descriptors,
- * and resets all global state to its initial values.
- *
- * This function is called when the program is exiting due to a signal or
- * error.
- */
 static void cleanup_globals(void)
 {
     for (int i = 0; i < num_discovered_sensors; i++)
@@ -269,20 +241,6 @@ static void cleanup_globals(void)
 #endif
 }
 
-/**
- * Main function of the highesttemp daemon.
- *
- * This function initializes logging, sets up signal handling for graceful
- * termination, discovers available temperature sensors, and optionally
- * initializes NVIDIA GPU temperature reading support. It then enters the
- * main loop, which runs until terminated, reading temperatures from
- * discovered sensors and writing the highest temperature to the output
- * file at regular intervals. The output file is created with specified
- * permissions and ownership, and the process drops root privileges after
- * setup is complete.
- *
- * @return 0 on successful completion, 1 on error during initialization.
- */
 int main(void)
 {
     struct sigaction action;
@@ -299,7 +257,6 @@ int main(void)
     {
         syslog(LOG_ERR, "Failed to open output file %s: %m", outfile);
 
-        cleanup_globals();
         closelog();
 
         return 1;
@@ -312,7 +269,6 @@ int main(void)
         syslog(LOG_ERR, "User 'goghor' not found: %m");
 
         close(out_fd);
-        cleanup_globals();
         closelog();
 
         return 1;
@@ -325,7 +281,6 @@ int main(void)
         syslog(LOG_ERR, "Group 'goghor' not found: %m");
 
         close(out_fd);
-        cleanup_globals();
         closelog();
 
         return 1;
@@ -340,16 +295,33 @@ int main(void)
     output_fd = out_fd;
 
     memset(&action, 0, sizeof(struct sigaction));
-
     action.sa_handler = handle_sigterm;
-
     sigaction(SIGTERM, &action, NULL);
     sigaction(SIGINT, &action, NULL);
-    discover_sensors();
+
+    if (discover_sensors() == -1)
+    {
+        syslog(LOG_ERR, "Failed to discover sensors.");
+
+        cleanup_globals();
+        closelog();
+
+        return 1;
+    }
 
 #ifdef NVIDIA
     init_nvidia();
 #endif
+
+    if (setgroups(1, &target_gid) == -1)
+    {
+        syslog(LOG_ERR, "Failed to setgroups: %m");
+
+        cleanup_globals();
+        closelog();
+
+        return 1;
+    }
 
     if (setgid(target_gid) == -1)
     {
@@ -370,9 +342,6 @@ int main(void)
 
         return 1;
     }
-
-    if (setgroups(1, &target_gid) == -1)
-        syslog(LOG_WARNING, "Failed to setgroups: %m");
 
     while (running)
     {
@@ -403,10 +372,20 @@ int main(void)
             }
             else
             {
-                dprintf(output_fd, "%d\n", highest_current_temp);
+                int n_written = dprintf(output_fd, "%d\n", highest_current_temp);
 
-                if (fsync(output_fd) == -1)
-                    syslog(LOG_WARNING, "fsync failed for output file: %m");
+                if (n_written > 0)
+                {
+                    if (ftruncate(output_fd, n_written) == -1)
+                        syslog(LOG_WARNING, "ftruncate failed for output file: %m");
+
+                    if (fsync(output_fd) == -1)
+                        syslog(LOG_WARNING, "fsync failed for output file: %m");
+                }
+                else
+                {
+                    syslog(LOG_WARNING, "dprintf failed for output file: %m");
+                }
             }
         }
     }
