@@ -53,32 +53,12 @@ static nvmlDevice_t nvidia_device;
 static const char *outfile = "/dev/shm/highesttemp";
 static volatile sig_atomic_t running = 1;
 
-/**
- * Signal handler for SIGTERM.
- *
- * Sets the running flag to 0, triggering the loop in main() to exit
- * gracefully.
- *
- * @param signum The signal number, ignored.
- */
 static void handle_sigterm(int signum)
 {
     (void)signum;
 
     running = 0;
 }
-
-/**
- * Discovers and opens temperature sensor files from hwmon devices.
- *
- * This function scans the /sys/class/hwmon directory for hardware
- * monitor devices. It identifies devices of interest such as "k10temp",
- * "amdgpu", "coretemp", and "nvme". For each device found, it opens
- * available temperature input files and stores their file descriptors
- * in the discovered_sensor_fds array, expanding the array as needed.
- *
- * @return 0 on success, -1 on memory allocation failure.
- */
 
 static int discover_sensors(void)
 {
@@ -112,7 +92,7 @@ static int discover_sensors(void)
         if (nl)
             *nl = '\0';
 
-        if (strcmp(buffer, "k10temp") == 0 || strcmp(buffer, "amdgpu") == 0 || strcmp(buffer, "coretemp") == 0 || strcmp(buffer, "nvme") == 0)
+        if (strcmp(buffer, "k10temp") == 0 || strcmp(buffer, "amdgpu") == 0 || strcmp(buffer, "coretemp") == 0)
         {
             char temp_pattern[PATH_MAX];
 
@@ -244,10 +224,7 @@ static void cleanup_globals(void)
 int main(void)
 {
     struct sigaction action;
-    struct passwd *pw;
-    struct group *gr;
-    uid_t target_uid;
-    gid_t target_gid;
+    int last_written_temp = INT_MIN;
 
     openlog("highesttemp", LOG_PID | LOG_CONS, LOG_DAEMON);
 
@@ -261,36 +238,6 @@ int main(void)
 
         return 1;
     }
-
-    pw = getpwnam("goghor");
-
-    if (pw == NULL)
-    {
-        syslog(LOG_ERR, "User 'goghor' not found: %m");
-
-        close(out_fd);
-        closelog();
-
-        return 1;
-    }
-
-    gr = getgrnam("goghor");
-
-    if (gr == NULL)
-    {
-        syslog(LOG_ERR, "Group 'goghor' not found: %m");
-
-        close(out_fd);
-        closelog();
-
-        return 1;
-    }
-
-    target_uid = pw->pw_uid;
-    target_gid = gr->gr_gid;
-
-    if (fchown(out_fd, target_uid, target_gid) == -1)
-        syslog(LOG_WARNING, "Failed to chown output file %s: %m", outfile);
 
     output_fd = out_fd;
 
@@ -313,36 +260,6 @@ int main(void)
     init_nvidia();
 #endif
 
-    if (setgroups(1, &target_gid) == -1)
-    {
-        syslog(LOG_ERR, "Failed to setgroups: %m");
-
-        cleanup_globals();
-        closelog();
-
-        return 1;
-    }
-
-    if (setgid(target_gid) == -1)
-    {
-        syslog(LOG_ERR, "Failed to setgid to 'goghor': %m");
-
-        cleanup_globals();
-        closelog();
-
-        return 1;
-    }
-
-    if (setuid(target_uid) == -1)
-    {
-        syslog(LOG_ERR, "Failed to setuid to 'goghor': %m");
-
-        cleanup_globals();
-        closelog();
-
-        return 1;
-    }
-
     while (running)
     {
         usleep(DT);
@@ -364,7 +281,7 @@ int main(void)
             highest_current_temp = nvidia_temp;
 #endif
 
-        if (highest_current_temp != INT_MIN)
+        if (highest_current_temp != INT_MIN && highest_current_temp != last_written_temp)
         {
             if (lseek(output_fd, 0, SEEK_SET) == -1)
             {
@@ -379,8 +296,7 @@ int main(void)
                     if (ftruncate(output_fd, n_written) == -1)
                         syslog(LOG_WARNING, "ftruncate failed for output file: %m");
 
-                    if (fsync(output_fd) == -1)
-                        syslog(LOG_WARNING, "fsync failed for output file: %m");
+                    last_written_temp = highest_current_temp;
                 }
                 else
                 {

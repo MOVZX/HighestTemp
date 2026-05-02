@@ -18,7 +18,7 @@ if command -v nvidia-smi &> /dev/null
 then
     echo "nvidia-smi found, compiling with NVIDIA support."
 
-    gcc -O3 -DNVIDIA -o highesttemp highesttemp.c -lm -ldl
+    gcc -O3 highesttemp.c -o highesttemp -I/opt/cuda/include -lnvidia-ml
 else
     echo "nvidia-smi not found, compiling without NVIDIA support."
 
